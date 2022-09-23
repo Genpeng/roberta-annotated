@@ -120,5 +120,6 @@ dmypy.json
 .idea/
 
 # Project ignored files
-glue_data/
-uncased_L-12_H-768_A-12/
+datasets/
+models/
+outputs/
