@@ -12,77 +12,87 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""BERT finetuning runner."""
+"""Fine-tuning BERT on token classification tasks (NER, POS, CHUNKS)"""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import codecs
 import collections
 import os
+import pickle
+
+import tensorflow as tf
+
 import modeling
 import optimization
-import tokenization
-import tensorflow as tf
-from sklearn.metrics import f1_score, precision_score, recall_score
-from tensorflow.python.ops import math_ops
 import tf_metrics
-import pickle
-import codecs
-import sys
+import tokenization
 
-import sys
-reload(sys)
-sys.setdefaultencoding('utf8')
+if tf.__version__ >= "2.0":
+    tf = tf.compat.v1
 
 flags = tf.flags
-
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string(
-    "data_dir", None,
-    "The input datadir.",
-)
-
-flags.DEFINE_string(
-    "bert_config_file", None,
-    "The config json file corresponding to the pre-trained BERT model."
-)
+# region Data Training Arguments
 
 flags.DEFINE_string(
     "task_name", None, "The name of the task to train."
 )
 
 flags.DEFINE_string(
-    "token_name", "full", "The name of the task to train."
-)
-
-flags.DEFINE_string(
-    "output_dir", None,
-    "The output directory where the model checkpoints will be written."
-)
-
-## Other parameters
-flags.DEFINE_string(
-    "init_checkpoint", None,
-    "Initial checkpoint (usually from a pre-trained BERT model)."
+    "data_dir", None, "The input data directory.",
 )
 
 flags.DEFINE_bool(
-    "do_lower_case", True,
-    "Whether to lower case the input text."
+    "do_lower_case",
+    True,
+    "Whether to lower case the input text. Should be True for "
+    "uncased models and False for cased models.",
 )
 
 flags.DEFINE_integer(
-    "max_seq_length", 128,
-    "The maximum total input sequence length after WordPiece tokenization."
+    "max_seq_length",
+    128,
+    "The maximum total input sequence length after WordPiece tokenization. "
+    "Sequences longer than this will be truncated, and sequences shorter "
+    "than this will be padded.",
 )
 
-flags.DEFINE_bool(
-    "do_train", False,
-    "Whether to run training."
+# endregion
+
+# region Model Arguments
+
+flags.DEFINE_string(
+    "bert_config_file",
+    None,
+    "The config json file corresponding to the pre-trained BERT model. "
+    "This specifies the model architecture.",
 )
-flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
+
+flags.DEFINE_string(
+    "vocab_file", None, "The vocabulary file that the BERT model was trained on."
+)
+
+# endregion
+
+# region TensorFlow Training Arguments
+
+flags.DEFINE_string(
+    "output_dir",
+    None,
+    "The output directory where the model checkpoints will be written."
+)
+
+flags.DEFINE_string(
+    "init_checkpoint",
+    None,
+    "Initial checkpoint (usually from a pre-trained BERT model)."
+)
+
+flags.DEFINE_bool("do_train", False, "Whether to run training.")
 
 flags.DEFINE_bool("do_eval", False, "Whether to run eval on the dev set.")
 
@@ -99,22 +109,55 @@ flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 flags.DEFINE_float("num_train_epochs", 3.0, "Total number of training epochs to perform.")
 
 flags.DEFINE_float(
-    "warmup_proportion", 0.1,
+    "warmup_proportion",
+    0.1,
     "Proportion of training to perform linear learning rate warmup for. "
-    "E.g., 0.1 = 10% of training.")
+    "E.g., 0.1 = 10% of training."
+)
 
-flags.DEFINE_integer("save_checkpoints_steps", 1000,
-                     "How often to save the model checkpoint.")
-
-flags.DEFINE_integer("iterations_per_loop", 1000,
-                     "How many steps to make in each estimator call.")
-
-flags.DEFINE_string("vocab_file", None,
-                    "The vocabulary file that the BERT model was trained on.")
-tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
 flags.DEFINE_integer(
-    "num_tpu_cores", 8,
-    "Only used if `use_tpu` is True. Total number of TPU cores to use.")
+    "save_checkpoints_steps", 1000, "How often to save the model checkpoint."
+)
+
+flags.DEFINE_integer(
+    "iterations_per_loop", 1000, "How many steps to make in each estimator call."
+)
+
+flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
+
+flags.DEFINE_string(
+    "tpu_name",
+    None,
+    "The Cloud TPU to use for training. This should be either the name "
+    "used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 "
+    "url.",
+)
+
+flags.DEFINE_string(
+    "tpu_zone",
+    None,
+    "[Optional] GCE zone where the Cloud TPU is located in. If not "
+    "specified, we will attempt to automatically detect the GCE project from "
+    "metadata.",
+)
+
+flags.DEFINE_string(
+    "gcp_project",
+    None,
+    "[Optional] Project name for the Cloud TPU-enabled project. If not "
+    "specified, we will attempt to automatically detect the GCE project from "
+    "metadata.",
+)
+
+flags.DEFINE_integer(
+    "num_tpu_cores",
+    8,
+    "Only used if `use_tpu` is True. Total number of TPU cores to use.",
+)
+
+flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
+
+# endregion
 
 
 class InputExample(object):
@@ -643,40 +686,51 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
 
 def main(_):
     tf.logging.set_verbosity(tf.logging.INFO)
+
     processors = {
         "ner": NerProcessor,
-        "weiboner": WeiboNERProcessor,
-        "msraner": MsraNERProcessor
+        "msra_ner_processed": MsraNERProcessor,
+        "weibo_ner": WeiboNERProcessor,
     }
-    # if not FLAGS.do_train and not FLAGS.do_eval:
-    #     raise ValueError("At least one of `do_train` or `do_eval` must be True.")
+
+    # tokenization.validate_case_matches_checkpoint(
+    #     FLAGS.do_lower_case, FLAGS.init_checkpoint
+    # )  # validate whether the casing config is consistent with the checkpoint name
+
+    if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_predict:
+        raise ValueError(
+            "At least one of `do_train`, `do_eval` or `do_predict' must be True."
+        )
 
     bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
     if FLAGS.max_seq_length > bert_config.max_position_embeddings:
         raise ValueError(
             "Cannot use sequence length %d because the BERT model "
-            "was only trained up to sequence length %d" %
-            (FLAGS.max_seq_length, bert_config.max_position_embeddings))
-    if not os.path.exists(FLAGS.output_dir):
-        os.mkdir(FLAGS.output_dir)
+            "was only trained up to sequence length %d"
+            % (FLAGS.max_seq_length, bert_config.max_position_embeddings)
+        )  # `max_seq_length` cannot greater than `max_position_embeddings`
+
+    if not tf.gfile.Exists(FLAGS.output_dir):
+        tf.gfile.MakeDirs(FLAGS.output_dir)
+
     task_name = FLAGS.task_name.lower()
     if task_name not in processors:
-        raise ValueError("Task not found: %s" % (task_name))
+        raise ValueError("Task not found: %s" % task_name)
     processor = processors[task_name]()
 
     label_list = processor.get_labels()
 
     tokenizer = tokenization.FullTokenizer(
-        vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+        vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case
+    )
 
     tpu_cluster_resolver = None
     if FLAGS.use_tpu and FLAGS.tpu_name:
         tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-            FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-
+            FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project
+        )
     is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-
     run_config = tf.contrib.tpu.RunConfig(
         cluster=tpu_cluster_resolver,
         master=FLAGS.master,
@@ -685,7 +739,9 @@ def main(_):
         tpu_config=tf.contrib.tpu.TPUConfig(
             iterations_per_loop=FLAGS.iterations_per_loop,
             num_shards=FLAGS.num_tpu_cores,
-            per_host_input_for_training=is_per_host))
+            per_host_input_for_training=is_per_host
+        )
+    )
 
     train_examples = None
     num_train_steps = None
@@ -693,9 +749,7 @@ def main(_):
 
     if FLAGS.do_train:
         train_examples = processor.get_train_examples(FLAGS.data_dir)
-        num_train_steps = int(
-            len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
-        print(num_train_steps)
+        num_train_steps = len(train_examples) * FLAGS.num_train_epochs // FLAGS.train_batch_size
         num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
     model_fn = model_fn_builder(
@@ -706,7 +760,8 @@ def main(_):
         num_train_steps=num_train_steps,
         num_warmup_steps=num_warmup_steps,
         use_tpu=FLAGS.use_tpu,
-        use_one_hot_embeddings=FLAGS.use_tpu)
+        use_one_hot_embeddings=FLAGS.use_tpu
+    )
 
     estimator = tf.contrib.tpu.TPUEstimator(
         use_tpu=FLAGS.use_tpu,
@@ -714,12 +769,14 @@ def main(_):
         config=run_config,
         train_batch_size=FLAGS.train_batch_size,
         eval_batch_size=FLAGS.eval_batch_size,
-        predict_batch_size=FLAGS.predict_batch_size)
+        predict_batch_size=FLAGS.predict_batch_size
+    )
 
     if FLAGS.do_train:
         train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
         file_based_convert_examples_to_features(
-            train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file, FLAGS.output_dir)
+            train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file, FLAGS.output_dir
+        )
         tf.logging.info("***** Running training *****")
         tf.logging.info("  Num examples = %d", len(train_examples))
         tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
@@ -728,13 +785,16 @@ def main(_):
             input_file=train_file,
             seq_length=FLAGS.max_seq_length,
             is_training=True,
-            drop_remainder=True)
+            drop_remainder=True
+        )
         estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
+
     if FLAGS.do_eval:
         eval_examples = processor.get_dev_examples(FLAGS.data_dir)
         eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
         file_based_convert_examples_to_features(
-            eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file, FLAGS.output_dir)
+            eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file, FLAGS.output_dir
+        )
 
         tf.logging.info("***** Running evaluation *****")
         tf.logging.info("  Num examples = %d", len(eval_examples))
@@ -836,9 +896,9 @@ def main(_):
 
 
 if __name__ == "__main__":
-    flags.mark_flag_as_required("data_dir")
     flags.mark_flag_as_required("task_name")
-    flags.mark_flag_as_required("vocab_file")
+    flags.mark_flag_as_required("data_dir")
     flags.mark_flag_as_required("bert_config_file")
+    flags.mark_flag_as_required("vocab_file")
     flags.mark_flag_as_required("output_dir")
     tf.app.run()
